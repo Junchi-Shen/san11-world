@@ -58,6 +58,7 @@ struct Config {
     int getterCheck = 0;         // debug: log gate / port getter calls with an out-of-range index and their call sites
     int unitFirst = 0;           // debug (M9 tests): new units take the first free id from this one on
     int astarStats = 0;          // debug: time every A* call (0x567520) and log the slow ones
+    int astarEnter = 0;          // debug: log every A* call as it starts (the last one before a freeze is stuck)
     int astarMode = 3;           // A*: 0 original, 1 binary heap (same results), 2 + 2x heuristic, 3 + search window
     int astarMargin = 100;       // A* mode 3: search window margin in hexes
     int astarBenchSlow = 0;      // debug: replay slow A* calls with every variant
@@ -94,6 +95,7 @@ static void loadConfig() {
     g_cfg.watchRead = GetPrivateProfileIntW(g_section, L"watch_read", 0, ini);
     g_cfg.heapCheck = GetPrivateProfileIntW(g_section, L"heap_check", 0, ini);
     g_cfg.astarStats = GetPrivateProfileIntW(g_section, L"astar_stats", 0, ini);
+    g_cfg.astarEnter = GetPrivateProfileIntW(g_section, L"astar_enter", 0, ini);
     g_cfg.astarMode = GetPrivateProfileIntW(g_section, L"astar", 3, ini);
     g_cfg.astarMargin = GetPrivateProfileIntW(g_section, L"astar_margin", 100, ini);
     g_cfg.astarBenchSlow = GetPrivateProfileIntW(g_section, L"astar_bench_slow", 0, ini);
@@ -1277,6 +1279,9 @@ void automationCamera(float* x, float* z) {     // the scene camera's look-at (o
 }
 void automationGoto(float x, float z) { g_gotoX = x; g_gotoZ = z; InterlockedExchange(&g_gotoPending, 1); }
 
+static void installViewTweaks();
+static void installEnvFxGuard();
+
 static void installTerrainHooks() {
     static const uint8_t clampHead[] = { 0x83, 0xEC, 0x1C, 0xA1, 0xA0, 0x9F, 0x1B, 0x09 };
     g_clampOrig = (CameraClamp)makeTrampoline(0x5714a0, sizeof clampHead, clampHead);
@@ -1292,6 +1297,60 @@ static void installTerrainHooks() {
     if (mm) writeJmp(0x40fba0, (void*)minimapWorldToMap);
     logf("terrain hooks: k3st, gcol replaced; objs=%s; camera=%s; radar follows the camera=%s",
          g_objsOrig ? "yes" : "no", g_clampOrig ? "yes" : "no", mm ? "yes" : "no");
+    installViewTweaks();
+    installEnvFxGuard();
+}
+
+// 0x4d2d90「在可见格包围盒内随机选格放环境特效」里 div ecx 会因行跨度截断成 0 而除零崩溃。
+// 原版地图可见范围小不会触发；worldmod 世界 + 远缩放会让包围盒跨度超 16 位。加保护：跨度=0 就跳过。
+static void installEnvFxGuard() {
+    static const uint8_t head[] = { 0x0F, 0xBF, 0xCE, 0x33, 0xD2 };   // movsx ecx, si; xor edx, edx
+    // 行跨度 div @0x4d2de2（前面无 FPU 压栈）
+    uint8_t* at1 = (uint8_t*)0x4d2ddd;
+    if (!memcmp(at1, head, sizeof head)) {
+        uint8_t* c = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        uint8_t* p = c;
+        *p++ = 0x66; *p++ = 0x85; *p++ = 0xF6;                           // test si, si
+        *p++ = 0x0F; *p++ = 0x84; *(int32_t*)p = (int32_t)(0x4d2ea3 - ((uintptr_t)p + 4)); p += 4;  // jz 0x4d2ea3
+        *p++ = 0x0F; *p++ = 0xBF; *p++ = 0xCE;                           // movsx ecx, si
+        *p++ = 0x33; *p++ = 0xD2;                                        // xor edx, edx
+        *p++ = 0xE9; *(int32_t*)p = (int32_t)(0x4d2de2 - ((uintptr_t)p + 4)); p += 4;  // jmp 0x4d2de2
+        writeJmp(0x4d2ddd, c);
+    } else logf("env-fx guard @4d2ddd: unexpected bytes, not hooked");
+    // 列跨度 div @0x4d2e0d（前面 0x4d2e04 fild 压了 FPU 栈，跳转前要弹掉）
+    uint8_t* at2 = (uint8_t*)0x4d2e08;
+    if (!memcmp(at2, head, sizeof head)) {
+        uint8_t* c = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        uint8_t* p = c;
+        *p++ = 0x66; *p++ = 0x85; *p++ = 0xF6;                           // test si, si
+        uint8_t* jz = p; *p++ = 0x0F; *p++ = 0x84; p += 4;               // jz cleanup（占位，下面回填）
+        *p++ = 0x0F; *p++ = 0xBF; *p++ = 0xCE;                           // movsx ecx, si
+        *p++ = 0x33; *p++ = 0xD2;                                        // xor edx, edx
+        *p++ = 0xE9; *(int32_t*)p = (int32_t)(0x4d2e0d - ((uintptr_t)p + 4)); p += 4;  // jmp 0x4d2e0d
+        *(int32_t*)(jz + 2) = (int32_t)((uintptr_t)p - (uintptr_t)(jz + 6));           // jz -> cleanup
+        *p++ = 0xDD; *p++ = 0xD8;                                        // fstp st(0)（清理 fild）
+        *p++ = 0xE9; *(int32_t*)p = (int32_t)(0x4d2ea3 - ((uintptr_t)p + 4)); p += 4;  // jmp 0x4d2ea3
+        writeJmp(0x4d2e08, c);
+    } else logf("env-fx guard @4d2e08: unexpected bytes, not hooked");
+    logf("env-fx guard installed (div-by-zero protection x2)");
+}
+
+// 视图增强：缩放上限放大。
+// 让相机能缩到整个世界。
+static void installViewTweaks() {
+    float* zt = (float*)0x84b36c;
+    DWORD oldz; VirtualProtect(zt, 12, PAGE_READWRITE, &oldz);
+    zt[0] = 20000.0f; zt[1] = 40000.0f; zt[2] = 80000.0f;
+    VirtualProtect(zt, 12, oldz, &oldz);
+    *(float*)0x8b95ec = 80000.0f;                  // 立即生效（当前档）
+    logf("view tweaks: zoom table %g/%g/%g", zt[0], zt[1], zt[2]);
+    // 第二表 0x84b378（整数，0x5a0b90 读入 0x8a5a40，疑似视野格数上限）150/300/500 -> 1500/3000/6000
+    DWORD oldg; VirtualProtect((void*)0x84b378, 12, PAGE_READWRITE, &oldg);
+    *(int*)0x84b378 = 2000;
+    *(int*)(0x84b378 + 4) = 4000;
+    *(int*)(0x84b378 + 8) = 8000;
+    VirtualProtect((void*)0x84b378, 12, oldg, &oldg);
+    logf("view tweaks: 第二表 %d/%d/%d", *(int*)0x84b378, *(int*)(0x84b378 + 4), *(int*)(0x84b378 + 8));
 }
 
 // ---------------------------------------------------------------- 中地圖 (midmap.cpp, research/midmap_re.md)
@@ -1627,7 +1686,7 @@ static void installHooks() {
     if (g_cfg.unitFirst > 0) logf("unit_first=%d: %s", g_cfg.unitFirst, installUnitFirst() ? "installed" : "NOT installed (unexpected code)");
     logf("hooks installed (hexCtor, shex=%s, hex28 dirty-page clear=%s)", g_shexOrig ? "yes" : "no", clear ? "yes" : "no");
     PathfindConfig pf = {};
-    pf.mode = g_cfg.astarMode; pf.margin = g_cfg.astarMargin; pf.benchSlow = g_cfg.astarBenchSlow; pf.benchGoal = g_cfg.astarBenchGoal; pf.stats = g_cfg.astarStats; pf.verify = g_cfg.astarVerify; pf.benchable = g_cfg.automation;
+    pf.mode = g_cfg.astarMode; pf.margin = g_cfg.astarMargin; pf.benchSlow = g_cfg.astarBenchSlow; pf.benchGoal = g_cfg.astarBenchGoal; pf.stats = g_cfg.astarStats; pf.enterLog = g_cfg.astarEnter; pf.verify = g_cfg.astarVerify; pf.benchable = g_cfg.automation;
     pf.chinaLo = g_cfg.Y0; pf.chinaHi = g_cfg.X0; pf.hex28 = g_hex28Alloc; pf.hex28Size = g_hex28AllocSize;
     pf.clear28 = clear ? clearHex28Dirty : clearHex28All;
     pathfindInstall(pf, logf);
@@ -1725,7 +1784,7 @@ static void init() {
         hookIat(0x74e2a8, (void*)createFileAHook);
     }
     if (g_cfg.automation) automationInit(g_dir, logf);
-    if (g_cfg.autoSkip) autoSkipInit(logf);
+    if (g_cfg.autoSkip) autoSkipInit(g_dir, logf);
     if (!g_cfg.enable) return;
     if (!configValid()) {
         logf("ERROR: invalid [map] settings (width/height must be multiples of 200, <= 8000; china_x/china_y inside, china_y even). Patches disabled.");

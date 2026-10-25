@@ -374,6 +374,19 @@ void run(char* line, FILE* out) {
     else if (!strcmp(cmd, "mem") && sscanf_s(line, "%*s %x %d", (unsigned*)&a, &b) == 2) dumpMem(out, (uint32_t)a, b > 4096 ? 4096 : b);
     else if (!strcmp(cmd, "unitclone") && sscanf_s(line, "%*s %d %259[^\r\n]", &a, arg, (unsigned)sizeof arg) == 2)
         fprintf(out, "unitclone: %d\n", unitsClone(a, arg));       // debug (M9 tests): units.cpp
+    else if (!strcmp(cmd, "wild") && sscanf_s(line, "%*s %d", &a) == 1) {   // wild <city>: 在野/未登场/未发现武将都去这个城市
+        int moved = 0;
+        for (int i = 0; i < 1100; i++) {
+            uint8_t* p = (uint8_t*)(uintptr_t)(0x720DA14 + (size_t)i * 0x190);
+            int status = *(int*)(p + 0xa0);
+            if (status == 4 || status == 6 || status == 7) {       // 在野 / 未登场 / 未发现
+                *(int*)(p + 0x98) = a;                              // 所在
+                *(int*)(p + 0x9c) = a;                              // 位置
+                moved++;
+            }
+        }
+        fprintf(out, "wild: %d officers moved to city %d\n", moved, a);
+    }
     else if (!strcmp(cmd, "radardump") && sscanf_s(line, "%*s %259[^\r\n]", arg, (unsigned)sizeof arg) == 1)
         fprintf(out, "radardump: %d\n", radarDump(arg));
     else if (!strcmp(cmd, "poke") && sscanf_s(line, "%*s %x %x", (unsigned*)&a, (unsigned*)&b) == 2) {   // poke <addr> <dword>, hex
@@ -417,13 +430,14 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 DWORD WINAPI commandThread(void*) {
-    // keep the game window out of the user's way: bottom of the z-order, never activated
-    for (int i = 0; i < 300 && !window(); i++) Sleep(100);
-    if (HWND w = window()) {
-        SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        g_origProc = (WNDPROC)SetWindowLongPtrA(w, GWLP_WNDPROC, (LONG_PTR)wndProc);
-        post(WM_ACTIVATEAPP, TRUE, 0); post(WM_ACTIVATE, WA_ACTIVE, 0); post(WM_SETFOCUS, 0, 0);
-        if (g_log) g_log("automation: window %p subclassed", w);
+    if (g_automation) {                                     // keep the game window out of the user's way (tests only)
+        for (int i = 0; i < 300 && !window(); i++) Sleep(100);
+        if (HWND w = window()) {
+            SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            g_origProc = (WNDPROC)SetWindowLongPtrA(w, GWLP_WNDPROC, (LONG_PTR)wndProc);
+            post(WM_ACTIVATEAPP, TRUE, 0); post(WM_ACTIVATE, WA_ACTIVE, 0); post(WM_SETFOCUS, 0, 0);
+            if (g_log) g_log("automation: window %p subclassed", w);
+        }
     }
     wchar_t cmdPath[MAX_PATH], donePath[MAX_PATH], tmpPath[MAX_PATH];
     swprintf_s(cmdPath, L"%s\\worldmod_cmd.txt", g_dir);
@@ -444,10 +458,17 @@ DWORD WINAPI commandThread(void*) {
 
 }  // namespace
 
-void automationInit(const wchar_t* dir, TraceLogFn log) {
+// 命令通道（不碰窗口/输入）：automation 和 auto_skip 都用它，这样正常游戏也能收 worldmod_cmd.txt
+void commandInit(const wchar_t* dir, TraceLogFn log) {
     g_log = log;
-    g_automation = true;
     wcscpy_s(g_dir, dir);
+    CreateThread(nullptr, 256 << 10, commandThread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (g_log) g_log("command channel enabled (worldmod_cmd.txt)");
+}
+
+void automationInit(const wchar_t* dir, TraceLogFn log) {
+    g_automation = true;
+    commandInit(dir, log);                                   // 命令通道（设置 g_dir + 启动 commandThread）
     g_shotDone = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     if (!g_probeDone) g_probeDone = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     g_fake = 1;
@@ -460,8 +481,7 @@ void automationInit(const wchar_t* dir, TraceLogFn log) {
     hookIat(IAT_ClipCursor, (void*)hClipCursor);
     hookIat(IAT_SetForegroundWindow, (void*)hSetForegroundWindow);
     hookIat(IAT_IsIconic, (void*)hIsIconic);
-    CreateThread(nullptr, 256 << 10, commandThread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (g_log) g_log("automation enabled (worldmod_cmd.txt)");
+    if (g_log) g_log("automation enabled");
 }
 
 void automationOnEndScene(IDirect3DDevice9* d) {
@@ -471,8 +491,8 @@ void automationOnEndScene(IDirect3DDevice9* d) {
 
 // auto_skip in normal play: only the cursor and button queries are hooked, and they pass through to
 // Windows except while the skipper runs
-void autoSkipInit(TraceLogFn log) {
-    if (!g_log) g_log = log;
+void autoSkipInit(const wchar_t* dir, TraceLogFn log) {
+    commandInit(dir, log);                                   // 命令通道：auto_skip 下也开启（正常游戏可收命令）
     g_autoSkipOn = 1;
     if (g_automation) {                                          // the test copy: input is virtual anyway
         if (g_log) g_log("auto_skip enabled (with automation)");

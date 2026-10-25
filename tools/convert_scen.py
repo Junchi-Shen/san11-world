@@ -667,8 +667,8 @@ def find_files(game):
     master = [p for p in sc.iterdir() if p.name.lower() == 'scenario.s11']
     ts = sorted(p for p in td.iterdir() if p.is_file() and p.name.lower().startswith('ts')
                 and p.suffix.lower() == '.s11') if td.is_dir() else []
-    if len(scen) != 14 or len(master) != 1:
-        raise ConvError(f'expected 14 Scen*.s11 and Scenario.s11 in {sc}, found {len(scen)} / {len(master)}')
+    if len(scen) not in (14, 15) or len(master) != 1:
+        raise ConvError(f'expected 14 or 15 Scen*.s11 and Scenario.s11 in {sc}, found {len(scen)} / {len(master)}')
     return scen, master[0], ts
 
 

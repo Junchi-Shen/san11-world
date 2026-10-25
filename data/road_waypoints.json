@@ -1,0 +1,6 @@
+[
+ {"cities": ["里昂", "都靈"], "via": [[44.93, 6.72]], "name": "Alpis Cottia (Mont Genèvre), the Roman road Lugdunum - Augusta Taurinorum"},
+ {"cities": ["貝桑", "都靈"], "via": [[45.87, 7.17]], "name": "Alpis Poenina (Great St Bernard), Vesontio - Augusta Praetoria - Augusta Taurinorum"},
+ {"cities": ["馬薩", "塔爾"], "via": [[37.28, 34.78]], "name": "Cilician Gates, Mazaca - Tarsus"},
+ {"cities": ["疏勒", "碎葉"], "via": [[40.55, 75.39]], "name": "Torugart pass, Kashgar - the Chu valley"}
+]

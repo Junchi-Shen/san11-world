@@ -9,6 +9,7 @@ struct PathfindConfig {
     int benchSlow;      // 1 = replay the first 10 slow calls (>= 5 ms) with every variant and log the times
     uint32_t benchGoal; // packed (lo | hi << 16) + 1, or 0: at calls 1, 20, 100, 300 also time every variant to this goal
     int stats;          // 1 = log calls slower than 5 ms and a summary every 10 s
+    int enterLog;       // 1 = log every call as it starts (the last one before a freeze is the stuck call)
     int verify;         // 1 = run the original too and compare HEX28 (mode 1 semantics)
     int benchable;      // 1 = hook even when nothing else is on, so "astar bench" works
     int chinaLo, chinaHi;   // where Koei's China sits: (0,0) "no position" defaults are moved there

@@ -1521,3 +1521,9 @@
 00597f5a 3 4 8b8c24649c0000 W*H+36 ; security cookie slot (after push)
 0059829a 3 4 8b8c24649c0000 W*H+36 ; security cookie slot (epilogue)
 00598144 1 4 b910270000 W*H/4 ; rep stosd count clearing the W*H byte map
+00441fa2 6 4 c786d001000000004843 f:40000 ; 雾起始距离 200→40000（世界单位，约 2000 格），配合 installViewTweaks
+00441fac 6 4 c786d401000000007a44 f:80000 ; 雾结束距离 1000→80000（约 4000 格）
+00403920 0 1 56 0xC3 ; 镜头补丁1.3: 隐藏远处云山图(灰白云海贴图0x12ba) ret
+005A25CA 2 1 D9402C 0x20 ; 镜头补丁1.3: 去除薄雾 fld[eax+0x2c]->fld[eax+0x20]
+00403CD0 0 1 83 0xC3 ; 镜头补丁1.3: 底色依天空色 -> ret (去除灰白底色)
+0057EE92 6 4 C70500968B000CBE753F 0x3FC80000 ; 镜头补丁1.3: 角度上限 55°->89.5°(俯瞰)

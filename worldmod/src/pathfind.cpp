@@ -314,6 +314,11 @@ extern "C" static Node* __cdecl astarDispatch(void* unit, uint32_t goal, const u
         }
     }
     // bench: an explicit goal at the next call, or (g_benchSlow) the next call that is slow in the original
+    if (g_cfg.enterLog) {
+        uint32_t s = count > 0 ? src[0] : 0;
+        g_log("A* enter (%d,%d) -> (%d,%d) %d src caller %p",
+              (short)s, (short)(s >> 16), (short)goal, (short)(goal >> 16), count, caller);
+    }
     if (InterlockedExchange(&g_benchPending, 0)) bench(unit, src, count, caller);
     if (g_cfg.benchGoal && (g_calls == 0 || g_calls == 19 || g_calls == 99 || g_calls == 299)) {
         g_benchGoal = g_cfg.benchGoal - 1;
@@ -363,7 +368,7 @@ void pathfindBench(int lo, int hi) {
 
 bool pathfindInstall(const PathfindConfig& cfg, TraceLogFn log) {
     g_cfg = cfg; g_log = log;
-    if (!cfg.mode && !cfg.stats && !cfg.verify && !cfg.benchable) return false;
+    if (!cfg.mode && !cfg.stats && !cfg.enterLog && !cfg.verify && !cfg.benchable) return false;
     uint8_t* site = (uint8_t*)0x567520;
     static const uint8_t expect[7] = { 0x83, 0xec, 0x24, 0x8b, 0x4c, 0x24, 0x28 };   // sub esp,24h; mov ecx,[esp+28h]
     if (memcmp(site, expect, 7) || site[0x5676c3 - 0x567520] != 0xB9 || site[0x567591 - 0x567520] != 0x05 ||

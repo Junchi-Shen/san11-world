@@ -37,6 +37,7 @@ Npy g_height, g_mat;
 int g_cvr = 0, g_cvc = 0;                  // global vertex of China stage vertex (0,0)
 uint8_t* g_chinaV = nullptr;               // N*N*VREC, China stage vertices
 uint8_t* g_chinaQ = nullptr;               // QN*QN*QREC, China stage quads
+uint8_t* g_patch = nullptr;                // N*N, 1 = China stage vertex drawn from the world grid (china_patch.bin)
 bool g_haveChina = false;
 uint8_t g_pal[64][3];                      // material -> colour, learned from China's current colours
 
@@ -65,13 +66,15 @@ uint8_t* allocArray(size_t rowBytes, size_t rows, uint8_t fill) {
 
 int shiftFor(int n) { int s = 0; while ((1 << s) < n) s++; return s; }
 
+inline bool inPatch(int kr, int kc) { return g_patch && g_patch[(size_t)kr * N + kc]; }
 inline bool inChinaVertex(int r, int c) {
     int kr = r - g_cvr, kc = c - g_cvc;
-    return kr >= g_ch0 && kr <= g_ch1 && kc >= g_ch0 && kc <= g_ch1;
+    return kr >= g_ch0 && kr <= g_ch1 && kc >= g_ch0 && kc <= g_ch1 && !inPatch(kr, kc);
 }
 inline bool inChinaQuad(int r, int c) {            // quad (r,c) spans vertices r..r+1, c..c+1
     int kr = r - g_cvr, kc = c - g_cvc;
-    return kr >= g_ch0 && kr < g_ch1 && kc >= g_ch0 && kc < g_ch1;
+    return kr >= g_ch0 && kr < g_ch1 && kc >= g_ch0 && kc < g_ch1 &&
+           !inPatch(kr, kc) && !inPatch(kr, kc + 1) && !inPatch(kr + 1, kc) && !inPatch(kr + 1, kc + 1);
 }
 
 inline uint8_t* vtx(int r, int c) { return L.VB + ((size_t)r * L.VC + c) * VREC; }
@@ -99,6 +102,10 @@ void learnPalette(const uint8_t* colours) {
     }
     for (int m = 0; m < 64; m++)
         for (int k = 0; k < 3; k++) g_pal[m][k] = cnt[m] ? (uint8_t)(sum[m][k] / cnt[m] + 0.5) : 110;
+    if (g_log) {
+        for (int m = 0; m < 64; m++)
+            g_log("pal[%d] = (%u,%u,%u) cnt=%.0f", m, g_pal[m][0], g_pal[m][1], g_pal[m][2], cnt[m]);
+    }
 }
 
 // Koei's layer encoding for corner materials a=(r,c) b=(r,c+1) cc=(r+1,c) d=(r+1,c+1).
@@ -222,6 +229,18 @@ bool terrainOpen(const wchar_t* dir, int chinaLo, int chinaHi) {
     }
     if (!ok) { g_height.data = nullptr; g_mat.data = nullptr; g_ch0 = 0; g_ch1 = 1024; }
     if (g_log) g_log("terrain: world vertex grid %s", ok ? "mapped" : "missing: Koei's whole stage is used, flat placeholder elsewhere");
+    // china_patch.bin (tools/make_world.py): "WCPM", u32 1025, 1025x1025 bytes; only with the world grid
+    if (ok) {
+        swprintf_s(p, L"%s\\china_patch.bin", dir);
+        FILE* f = nullptr; _wfopen_s(&f, p, L"rb");
+        uint32_t h[2] = {};
+        if (f && fread(h, 4, 2, f) == 2 && h[0] == 'MPCW' && h[1] == (uint32_t)N) {
+            if (!g_patch) g_patch = (uint8_t*)VirtualAlloc(nullptr, (size_t)N * N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (g_patch && fread(g_patch, 1, (size_t)N * N, f) != (size_t)N * N) { VirtualFree(g_patch, 0, MEM_RELEASE); g_patch = nullptr; }
+        } else if (g_patch) { VirtualFree(g_patch, 0, MEM_RELEASE); g_patch = nullptr; }
+        if (f) fclose(f);
+        if (g_log) g_log("terrain: China patch %s", g_patch ? "loaded (china_patch.bin)" : "none");
+    }
     return ok;
 }
 

@@ -173,13 +173,13 @@ function drawCities() {
   });
 }
 
-// ---------------------------------------------------------------- validation (same rules as select_cities.py)
+// ---------------------------------------------------------------- validation (what gen_bases.py accepts)
 function cityProblem(i) {
   const c = S.cities[i];
   const cells = [[c.lo, c.hi], ...nbrs(c.lo, c.hi)];
   if (cells.some(([p, q]) => !inWorld(p, q))) return '超出地图';
-  if (cells.some(([p, q]) => p >= S.meta.china_lo - 4 && p < S.meta.china_lo + 204 && q >= S.meta.china_hi - 4 && q < S.meta.china_hi + 204))
-    return '太靠近中国区域（中国用光荣原版的城）';
+  const nIn = cells.filter(([p, q]) => inChina(p, q)).length;
+  if (nIn && nIn < cells.length) return '占地跨在中国区域的边上（要整个放在框里或框外）';
   const land = cells.filter(([p, q]) => !WATER.has(S.t[p * S.C + q])).length;
   if (land < 5) return `占地 7 格里只有 ${land} 格陆地（至少 5 格）`;
   for (let j = 0; j < S.cities.length; j++) {

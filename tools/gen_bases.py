@@ -15,11 +15,13 @@ Writes into --out (default world_dir; the world_dir inputs from make_world.py ar
   bases_objs.bin     their 3D city models (OBJS records added by worldmod)
   world_height.npy   the vertex heights with the land around each new city levelled (Koei's cities stand
                      on plateaus at their model's height); only when the world directory has vertex data
+  china_patch.bin    copied from the world directory (make_world.py): where worldmod draws China from it
 Id layout: cities 0..C-1 (Koei's 0..41 unchanged), gates C..C+9, ports C+10..N-1, special areas N..N+5,
 N = C+45. With --cities 42 the tables equal the originals byte for byte (--verify checks that).
 """
 import argparse
 import json
+import shutil
 import struct
 from collections import defaultdict, deque
 from pathlib import Path
@@ -47,15 +49,116 @@ def hex_nbrs(y, x):
     return [(y + a, x + b) for a, b in d]
 
 
-def flatten_city_sites(w, out, new, r_flat=8, r_blend=12):
+def wall_ou_cells(pack, clo, chi):
+    """城墙（OBJS type 46/47/48）的 footprint 占用的世界 ou 格子。pack 是 Media/san11pkres.bin 的路径，
+    clo/chi 是 China 块的世界 hex 偏移（ou 偏移 = 2*clo, 2*chi）。内政用地（type 45）的 footprint 和这些
+    格子重叠时，游戏会拒绝创建它的 3D 物体，所以铺地时要用它避开城墙。"""
+    if not Path(pack).exists():
+        return set()
+    with open(pack, "rb") as f:
+        head = f.read(16)
+        if head[:4] != b"LINK":
+            return set()
+        count = struct.unpack_from("<I", head, 4)[0]
+        if 0x12C5 >= count:
+            return set()
+        f.seek(16 + 8 * 0x12C5)
+        off, size = struct.unpack("<II", f.read(8))
+        f.seek(off)
+        objs = f.read(size)
+    dy, dx = 2 * clo, 2 * chi
+    fp = ((0, 0), (-1, 0), (0, -1), (-1, -1))
+    out = set()
+    for i in range(65535):
+        rec = objs[8 + i * 14:8 + i * 14 + 14]
+        if not rec[0] or struct.unpack_from("<H", rec, 1)[0] not in (46, 47, 48):
+            continue
+        our = struct.unpack_from("<H", rec, 3)[0] + dy
+        ouc = struct.unpack_from("<H", rec, 5)[0] + dx
+        for a, b in fp:
+            out.add((our + a, ouc + b))
+    return out
+
+
+# Facility plots (内政用地): SHEX byte 5 = HEX20 bit18 (0x484090); on entering the map 0x57E910 lists each
+# city's bit18 hexes (by area) in its +0xF0 table of 30, without a bound check. Koei gives every city 10, 12,
+# 15, 18, 20 or 22 plots of soil (type 1), in 1-4 compact patches of 4-10, 3.5-14 hexes from the city, in its
+# own area, at most 26% of the flat land there (every Koei city has 76 or more such hexes). New cities get the
+# tier of their town's population about AD 200 (data/city_population.json, by name, "pop"); without one, of
+# their rank; places that did not exist then get PLOT_GONE. They go 3-14 hexes out on flat land of the city's
+# own territory, at most PLOT_LAND_SHARE of it, so cities with little land get fewer.
+PLOT_TIERS = ((250000, 22), (100000, 20), (40000, 18), (15000, 15), (5000, 12), (0, 10))
+RANK_PLOTS = {1: 15, 2: 12, 3: 10}
+PLOT_GONE = 6
+PLOT_LAND_SHARE = 0.25
+PLOT_MIN = 2                                    # ... but this many wherever the land allows
+PLOT_TERRAIN = (0, 1, 2, 3, 5, 9, 14)           # flat cover and banks (no roads, water, mountains)
+
+
+def plot_count(c, pop):
+    p = pop.get(c["name"], {})
+    if p.get("existed_200") is False:
+        return PLOT_GONE
+    if p.get("pop"):
+        return next(n for lim, n in PLOT_TIERS if p["pop"] >= lim)
+    return RANK_PLOTS.get(c.get("rank", 3), PLOT_TIERS[-1][1])
+
+
+def place_plots(y0, x0, n, ok):
+    """up to n plot hexes (and no more than PLOT_LAND_SHARE of the land that may hold one) for the city at
+    (y0, x0), in patches of about 7 grown around seeds spread round the city 4-9 hexes out; ok(y, x): the hex
+    may be a plot of this city"""
+    def dist(y, x):
+        return np.hypot((y - y0) * 0.866, x + 0.5 * (y & 1) - x0 - 0.5 * (y0 & 1))
+    cand = {(y, x) for y in range(y0 - 17, y0 + 18) for x in range(x0 - 15, x0 + 16)
+            if 3 <= dist(y, x) <= 14 and ok(y, x)}
+    n = min(n, max(PLOT_MIN, int(PLOT_LAND_SHARE * len(cand))), len(cand))
+    if n <= 0:
+        return []
+    k = max(1, round(n / 7))
+    seeds = []
+    for _ in range(k):
+        pool = [h for h in sorted(cand) if 4 <= dist(*h) <= 9] or sorted(cand)
+        if not pool:
+            break
+        if seeds:
+            h = max(pool, key=lambda h: min(np.hypot((h[0] - s[0]) * 0.866, h[1] - s[1]) for s in seeds))
+        else:
+            h = min(pool, key=lambda h: abs(dist(*h) - 6))
+        seeds.append(h)
+    def grow(s, size):
+        patch = [s]
+        cand.discard(s)
+        while len(patch) < size:
+            nxt = {h for p in patch for h in hex_nbrs(*p) if h in cand}
+            if not nxt:
+                break
+            h = min(sorted(nxt), key=lambda h: np.hypot((h[0] - s[0]) * 0.866, h[1] - s[1]))
+            patch.append(h); cand.discard(h)
+        return patch
+    out = []
+    for i, s in enumerate(seeds):
+        size = (n - len(out)) // (len(seeds) - i)      # what is left, spread over the patches still to grow
+        if size > 0 and s in cand:
+            out += grow(s, size)
+    while len(out) < n and cand:                       # patches that could not grow: start more
+        out += grow(min(sorted(cand), key=lambda h: abs(dist(*h) - 6)), n - len(out))
+    return out
+
+
+def flatten_city_sites(w, out, new, clo, chi, patch, r_flat=8, r_blend=12):
     """Level the land around each new city to one height (Koei's cities stand on plateaus) and return
     those heights. Reads w/world_height.npy and w/world_mat.npy (material 0 = water, left alone) and
-    writes out/world_height.npy; without vertex data (a --hex-only world) every city gets Koei's usual 20."""
+    writes out/world_height.npy; without vertex data (a --hex-only world) every city gets Koei's usual 20.
+    A city inside Koei's block stands on his stage (the game draws his own there, which is not levelled):
+    its height is his terrain height at the centre, so pick a flat site for it. The patch (make_world's
+    china_patch(), 200x200 mask) is drawn from world_height.npy like the world outside."""
     src = w / "world_height.npy"
     if not src.exists() or not new:
         return [20] * len(new)
     dst = np.array(np.load(src))                     # in memory (~30 MB), so --out may equal the world directory
     mat = np.load(w / "world_mat.npy", mmap_mode="r")
+    koei_v = np.load(DATA / "china_k3st_v.npy", mmap_mode="r")
     yy, xx = np.mgrid[-r_blend:r_blend + 1, -r_blend:r_blend + 1]
     d = np.hypot(yy, xx)
     wgt = np.clip((r_blend - d) / (r_blend - r_flat), 0, 1)          # 1 inside r_flat, 0 beyond r_blend
@@ -63,6 +166,9 @@ def flatten_city_sites(w, out, new, r_flat=8, r_blend=12):
     for c in new:
         vr = c["lo"] * 4 + 114
         vc = c["hi"] * 4 + 114 + 2 * (c["lo"] & 1)
+        if clo <= c["lo"] < clo + 200 and chi <= c["hi"] < chi + 200 and not patch[c["lo"] - clo, c["hi"] - chi]:
+            heights.append(int(koei_v[vr - 4 * clo, vc - 4 * chi, 0]))
+            continue
         sl = (slice(vr - r_blend, vr + r_blend + 1), slice(vc - r_blend, vc + r_blend + 1))
         hw = dst[sl].astype(np.float32)
         land = mat[sl] != 0
@@ -111,12 +217,13 @@ def hex_graph(cost):
 # the cheapest seed. A Koei seed starts with the walking cost from the nearest Koei city (so his areas
 # grow outward around his cities, not as a strip parallel to the block edge); the decorative margins
 # (special areas) start at 0. A band hex changes only when a new city wins it (Koei's own areas never move
-# inside the block, and nothing changes next to a Koei base); outside the block Koei's areas continue.
+# inside the block, and nothing changes next to a Koei base or on his facility plots); outside the block
+# Koei's areas continue.
 BAND = 12
 
 
 def territories(t, new, clo, chi, china_area, koei_pos, coast=6, max_cost=60.0):
-    """area of every hex outside the core of the block (new cities 42 + k, Koei areas in Koei numbering
+    """area of every hex outside the core of the block (new cities by their id, Koei areas in Koei numbering
     as negative -1 - a, -2**30 = none) and the band hexes a new city wins (mask)"""
     from scipy.sparse.csgraph import dijkstra
     R, C = t.shape
@@ -130,7 +237,7 @@ def territories(t, new, clo, chi, china_area, koei_pos, coast=6, max_cost=60.0):
     core_lo, core_hi = np.nonzero(core)
     seeds = np.concatenate([np.array([c["lo"] * C + c["hi"] for c in new], np.int64),
                             ((core_lo + clo) * C + core_hi + chi).astype(np.int64)])
-    label = np.concatenate([42 + np.arange(len(new)), -1 - china_area[core_lo, core_hi]])
+    label = np.concatenate([np.array([c["id"] for c in new], np.int64), -1 - china_area[core_lo, core_hi]])
     # start cost of the Koei seeds: walking cost from the nearest Koei city (0 for the special areas)
     kcity = np.array([lo_ * C + hi_ for lo_, hi_ in koei_pos], np.int64)
     dk = dijkstra(g, indices=kcity, min_only=True)
@@ -170,6 +277,39 @@ def territories(t, new, clo, chi, china_area, koei_pos, coast=6, max_cost=60.0):
     blab = lab[clo:clo + 200, chi:chi + 200]
     won = (~core) & (blab >= 42) & ~near_base
     return lab, won
+
+
+# New cities inside Koei's block take their territory out of his areas (his gates' and ports' too, which
+# reach far inland): a block hex goes to the cheapest of them when walking there from it is cheaper than
+# from every other base. The hexes on or next to Koei's bases, his facility plots and open sea never change
+# hands; everything else in the block stays as Koei drew it.
+def block_territories(t, cities, others, clo, chi, plots, max_cost=60.0, m=80):
+    """block-local labels (city id, -1 = Koei's area stays) for the new cities inside the block
+    (cities: [{id, lo, hi}]); others: [(lo, hi)] of every other base (Koei's base hexes, the new cities outside)"""
+    from scipy.sparse.csgraph import dijkstra
+    R, C = t.shape
+    y0, y1 = max(0, clo - m), min(R, clo + 200 + m)
+    y0 -= y0 % 2                                          # keep row parity
+    x0, x1 = max(0, chi - m), min(C, chi + 200 + m)
+    tw = t[y0:y1, x0:x1]
+    cost = np.full(tw.shape, np.inf, np.float32)
+    for k, c in TERR_COST.items():
+        cost[tw == k] = c
+    g = hex_graph(cost)
+    W = x1 - x0
+    src = [(c["lo"] - y0) * W + c["hi"] - x0 for c in cities]
+    d_new, _, src_of = dijkstra(g, indices=src, min_only=True, return_predecessors=True)
+    d_other = dijkstra(g, indices=[(y - y0) * W + x - x0 for y, x in others if y0 <= y < y1 and x0 <= x < x1],
+                       min_only=True)
+    sl = (slice(clo - y0, clo - y0 + 200), slice(chi - x0, chi - x0 + 200))
+    d_new, d_other, src_of = (a_.reshape(y1 - y0, W)[sl] for a_ in (d_new, d_other, src_of))
+    tb = t[clo:clo + 200, chi:chi + 200]
+    near_base = ndimage.binary_dilation(np.isin(tb, (16, 17, 18)), iterations=2)
+    take = (d_new < d_other) & (d_new <= max_cost) & ~near_base & (plots == 0) & (tb != 8)
+    cid = {s: c["id"] for s, c in zip(src, cities)}
+    out = np.full((200, 200), -1, np.int64)
+    out[take] = [cid[s] for s in src_of[take]]
+    return out
 
 
 def bfs_matrix(edges, n, sources, nodes_ok):
@@ -246,13 +386,30 @@ def main():
     koei = json.loads((DATA / "cities_georef.json").read_text(encoding="utf-8"))
     area = np.full((R, Cc), N + 3, np.int32)              # unclaimed world: the special area Koei used for its margins (90)
     china_area = rec[clo:clo + 200, chi:chi + 200, 1].astype(np.int32) | (rec[clo:clo + 200, chi:chi + 200, 2].astype(np.int32) << 8)
-    lab, won = territories(t, new, clo, chi, china_area, [(k["lo"] + clo, k["hi"] + chi) for k in koei])
+    seeds = [{**c, "id": 42 + k} for k, c in enumerate(new)]
+    inside = []                                           # new cities inside Koei's block (on his own terrain)
+    for c in new:
+        cells = [(c["lo"], c["hi"])] + hex_nbrs(c["lo"], c["hi"])
+        ins = [clo <= y < clo + 200 and chi <= x < chi + 200 for y, x in cells]
+        if any(ins) and not all(ins):
+            raise SystemExit(f"{c['name']}: its 7 hexes cross the edge of Koei's China block; move it fully inside or outside")
+        inside.append(ins[0])
+    lab, won = territories(t, [s for s, i in zip(seeds, inside) if not i], clo, chi, china_area,
+                           [(k["lo"] + clo, k["hi"] + chi) for k in koei])
     unclaimed = lab == -2 ** 30
     koei_lab = (lab < 0) & ~unclaimed
     area[lab >= 42] = lab[lab >= 42]
     area[koei_lab] = np.vectorize(renum)(-1 - lab[koei_lab])              # Koei's areas continued outward
     area[clo:clo + 200, chi:chi + 200] = -1               # China keeps Koei's own areas (remapped by worldmod)
-    band_new = np.where(won, lab[clo:clo + 200, chi:chi + 200], -1)       # band hexes taken by new cities
+    band_new = np.where(won & (rec[clo:clo + 200, chi:chi + 200, 5] == 0),     # band hexes taken by new cities
+                        lab[clo:clo + 200, chi:chi + 200], -1)
+    if any(inside):
+        bases = [(y + clo, x + chi) for y, x in zip(*np.nonzero(np.isin(t[clo:clo + 200, chi:chi + 200], (16, 17, 18))))]
+        blk_lab = block_territories(t, [s for s, i in zip(seeds, inside) if i],
+                                    bases + [(s["lo"], s["hi"]) for s, i in zip(seeds, inside) if not i],
+                                    clo, chi, rec[clo:clo + 200, chi:chi + 200, 5])
+        band_new = np.where(blk_lab >= 0, blk_lab, band_new)
+    foot_blk = np.zeros((200, 200), bool)                 # city hexes of the new cities inside the block
     for k, c in enumerate(new):
         cid = 42 + k
         for y, x in [(c["lo"], c["hi"])] + hex_nbrs(c["lo"], c["hi"]):
@@ -260,6 +417,37 @@ def main():
             area[y, x] = cid
             rec[y, x, 0] = CITY_T
             rec[y, x, 4] = 6
+            if inside[k]:
+                band_new[y - clo, x - chi] = cid
+                foot_blk[y - clo, x - chi] = True
+    # facility plots: soil hexes flagged in SHEX byte 5, in the city's own territory
+    pf = DATA / "city_population.json"
+    pop = json.loads(pf.read_text(encoding="utf-8")) if pf.exists() else {}
+    plot_blk = np.zeros((200, 200), bool)
+    plots_made, plots_short = 0, []
+    wall_ou = wall_ou_cells(Path(a.game) / "Media" / "san11pkres.bin", clo, chi)
+
+    def plot_free(y, x):
+        our, ouc = 2 * y + 57, 2 * x + 57 + (y & 1)
+        return all((our + a, ouc + b) not in wall_ou for a, b in ((0, 0), (-1, 0), (0, -1), (-1, -1)))
+
+    def owner(y, x):
+        if clo <= y < clo + 200 and chi <= x < chi + 200:
+            return band_new[y - clo, x - chi]
+        return area[y, x]
+    for k, c in enumerate(new):
+        cid, want = 42 + k, plot_count(c, pop)
+        got = place_plots(c["lo"], c["hi"], want, lambda y, x: 0 <= y < R and 0 <= x < Cc and owner(y, x) == cid
+                          and t[y, x] in PLOT_TERRAIN and not rec[y, x, 5] and plot_free(y, x))
+        for y, x in got:
+            t[y, x] = 1
+            if clo <= y < clo + 200 and chi <= x < chi + 200:
+                plot_blk[y - clo, x - chi] = True
+            else:
+                rec[y, x, 0], rec[y, x, 4], rec[y, x, 5] = 1, 6, 1
+        plots_made += len(got)
+        if len(got) < want:
+            plots_short.append(f"{c['name']} {len(got)}/{want}")
 
     # ---- adjacency between areas (whole world, China included with Koei's ids renumbered)
     full = area.copy()
@@ -419,6 +607,11 @@ def main():
         r = ov.get((int(lo_), int(hi_)), bytearray(rec[clo + lo_, chi + hi_]))
         a_ = int(band_new[lo_, hi_])
         r[1], r[2] = a_ & 0xff, a_ >> 8
+        if foot_blk[lo_, hi_]:                            # city hex: as Koei's city hexes (flags clear)
+            r[0], r[4] = CITY_T, 6
+            r[3] = r[5] = r[6] = r[7] = r[8] = r[10] = 0
+        if plot_blk[lo_, hi_]:                            # facility plot: soil, byte 5 set
+            r[0], r[4], r[5] = 1, 6, 1
         ov[(int(lo_), int(hi_))] = r
     with open(out / "china_overrides.bin", "wb") as f:
         f.write(b"WCO2" + struct.pack("<I", len(ov)))
@@ -431,7 +624,13 @@ def main():
     # terrain height at the city centre, and the terrain around the city is a plateau at that height. So each
     # new city gets the median land height near its centre, and the land within 8 vertices is levelled to it
     # (blended out to 12), in a copy of world_height.npy written to the output directory.
-    heights = flatten_city_sites(w, out, new)
+    patch = np.load(w / "china_patch.npy") if (w / "china_patch.npy").exists() else np.zeros((200, 200), bool)
+    heights = flatten_city_sites(w, out, new, clo, chi, patch)
+    if out.resolve() != w.resolve():                      # worldmod draws the patch from world_height.npy
+        if (w / "china_patch.bin").exists():
+            shutil.copy2(w / "china_patch.bin", out / "china_patch.bin")
+        else:
+            (out / "china_patch.bin").unlink(missing_ok=True)
     with open(out / "bases_objs.bin", "wb") as f:
         f.write(b"WBOB" + struct.pack("<I", len(new)))
         for k, c in enumerate(new):
@@ -448,10 +647,14 @@ def main():
     koei_changed = {i: city_nb[i] for i in range(42) if city_nb[i] != koei_nb[i]}
     (out / "bases_cities.json").write_text(json.dumps({"C": C, "N": N, "new": cities, "koei_neighbours": koei_changed},
                                                       ensure_ascii=False, indent=1), encoding="utf-8")
-    sizes = np.bincount(area[(area >= 42) & (area < C)].ravel() - 42, minlength=dC) if dC else []
+    area[clo:clo + 200, chi:chi + 200] = -1               # the block's hexes are counted from band_new
+    owned = np.concatenate([area[(area >= 42) & (area < C)].ravel(), band_new[band_new >= 0].ravel()])
+    sizes = np.bincount(owned - 42, minlength=dC) if dC else []
     print(f"C={C} N={N}: {dC} new cities, {added} border links + {extra} distance links, territory sizes "
           f"{(int(np.min(sizes)), int(np.median(sizes)), int(np.max(sizes))) if dC else '-'}; "
           f"unreachable city pairs {int((MATC == 255).sum())}, base pairs {int((MAT87B == 255).sum())}")
+    print(f"facility plots: {plots_made} for {dC} new cities"
+          + (f"; fewer than planned (little land in the territory) for {len(plots_short)}: {', '.join(plots_short)}" if plots_short else ""))
 
 
 if __name__ == "__main__":

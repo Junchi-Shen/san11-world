@@ -1,0 +1,204 @@
+<title>水面与物件动画</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+  /* 设计：古风水墨纸底 × 水面青绿。浅色米纸、墨色文字；青绿做水的强调，赭褐做土地/城墙的强调。 */
+  :root {
+    --bg: #f5f1e8;
+    --surface: #fffdf7;
+    --fg: #2a2723;
+    --muted: #6b645a;
+    --accent: #1e6f6b;
+    --accent2: #a26b3a;
+    --line: #ddd5c4;
+    --good: #2e7d32;
+    --serif: "Noto Serif SC", "Songti SC", "SimSun", serif;
+    --sans: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1c1a17; --surface: #24211d; --fg: #eae4d8; --muted: #9a9184;
+      --accent: #4fb3ad; --accent2: #c98a52; --line: #3a352e; --good: #6cc070;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1c1a17; --surface: #24211d; --fg: #eae4d8; --muted: #9a9184;
+    --accent: #4fb3ad; --accent2: #c98a52; --line: #3a352e; --good: #6cc070;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    line-height: 1.7;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding-block: 40px 64px; }
+
+  header { padding-bottom: 8px; }
+  .eyebrow {
+    font-size: 12px; letter-spacing: 0.16em; color: var(--accent);
+    text-transform: uppercase; font-weight: 500; margin: 0 0 10px;
+  }
+  h1 {
+    font-family: var(--serif); font-weight: 700; font-size: clamp(28px, 5vw, 40px);
+    line-height: 1.2; margin: 0 0 14px; text-wrap: balance; letter-spacing: 0.01em;
+  }
+  .lede { color: var(--muted); font-size: 16px; max-width: 38em; margin: 0; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+  .chip {
+    font-size: 12px; font-weight: 500; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 11px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  section {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 26px 24px; margin-top: 26px;
+  }
+  .sec-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .sec-num {
+    font-family: var(--serif); font-weight: 700; color: var(--accent);
+    font-size: 15px; letter-spacing: 0.04em;
+  }
+  h2 { font-family: var(--serif); font-weight: 700; font-size: 22px; margin: 0; }
+  .sec-sub { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  p.body { margin: 14px 0 0; max-width: 60em; }
+  p.body code, td code {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 0.9em; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 1px 6px;
+  }
+
+  .water-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 18px; }
+  @media (max-width: 560px) { .water-row { grid-template-columns: 1fr; } }
+  .water-card { min-width: 0; }
+  .water-card .label { font-weight: 500; font-size: 14px; margin: 0 0 6px; display: flex; justify-content: space-between; }
+  .water-card .label span { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .water-card img {
+    width: 100%; border-radius: 8px; border: 1px solid var(--line);
+    image-rendering: pixelated; display: block;
+  }
+  .alpha-note { font-size: 12px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+  .bars { margin-top: 18px; display: grid; gap: 10px; }
+  .bar-row { display: grid; grid-template-columns: 120px 1fr 60px; gap: 12px; align-items: center; font-size: 13px; }
+  @media (max-width: 520px) { .bar-row { grid-template-columns: 84px 1fr 52px; } }
+  .bar-name { color: var(--muted); }
+  .bar-track { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; height: 18px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--accent2); }
+  .bar-fill.water { background: var(--accent); }
+  .bar-val { text-align: right; font-variant-numeric: tabular-nums; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 18px; font-size: 13.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; letter-spacing: 0.05em; }
+  td:last-child, th:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .tbl-wrap { overflow-x: auto; }
+
+  .map-wrap { margin-top: 18px; }
+  .map-wrap img { width: 100%; max-width: 440px; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .map-cap { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+  .note {
+    margin-top: 18px; padding: 12px 14px; border-left: 3px solid var(--accent2);
+    background: var(--bg); border-radius: 0 8px 8px 0; font-size: 13.5px; color: var(--muted);
+  }
+  .note strong { color: var(--fg); font-weight: 500; }
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 28px; text-align: center; }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">san11world · 动态素材</p>
+    <h1>水面与物件动画</h1>
+    <p class="lede">大地图上的两种动态素材，都靠引擎每帧更新、而不是靠贴图自身变化。水面是贴图帧动画，物件是 3D 模型姿态动画——下面是它们从资源包里还原出来的样子。</p>
+    <div class="meta">
+      <span class="chip">资源包 Media/san11pkres.bin</span>
+      <span class="chip">水面 WFTX0010 · 0x12EC</span>
+      <span class="chip">物件 OBJS0004 · 0x12C5</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">一</span>
+      <h2>水面 · 贴图帧动画</h2>
+      <span class="sec-sub">DXT5 · 256×256 · 8 帧</span>
+    </div>
+    <p class="body">水面覆盖层 <code>water.wft</code> 是 <strong>8 张 DXT5 纹理</strong>，等于 2 种水型 × 每型 4 帧波动画。每帧循环推进，让河面海面看起来在流动。半透明是写在 alpha 通道里的：浅水几乎不透明、看得到河底泥沙，深水半透明、透出下面的地形。</p>
+    <div class="water-row">
+      <div class="water-card">
+        <p class="label">浅水（帧 0–3）<span>alpha ≈ 205 · 不透明</span></p>
+        <img src="water_shallow.gif" alt="浅水 4 帧波动画">
+        <p class="alpha-note">沙黄色，河底可见；颜色丰富所以纹理较大。</p>
+      </div>
+      <div class="water-card">
+        <p class="label">深水（帧 4–7）<span>alpha ≈ 48 · 半透明</span></p>
+        <img src="water_deep.gif" alt="深水 4 帧波动画">
+        <p class="alpha-note">蓝青色，半透明覆盖在地形之上。</p>
+      </div>
+    </div>
+    <div class="note"><strong>动画机制：</strong>每个地形格在 <code>cell+0</code> 存水动画相位、<code>cell+2</code> 存周期，每帧由 <code>0x422da0</code> 推进相位（<code>add word [cell+0], cx</code>），再按相位取帧。水型写在 <code>cell+9</code> 的 bit0–1，决定用浅水还是深水那组纹理。</div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">二</span>
+      <h2>物件 · 3D 模型姿态动画</h2>
+      <span class="sec-sub">OBJS0004 · 65535 槽 × 14 字节</span>
+    </div>
+    <p class="body">物件不是贴图，而是摆在地图上的 3D 模型（城墙、城、关、港）。它的「动」由 <code>0x423230</code> 每帧改模型姿态/矩阵实现，所以没有一张张可看的动画帧，只有一份摆放清单和一套模型。清单本身是静态的，先看它记录了什么。</p>
+
+    <h3 style="font-family: var(--serif); font-size: 15px; margin: 22px 0 0;">原版物件类型分布 · 共 1195 条</h3>
+    <div class="bars">
+      <div class="bar-row">
+        <span class="bar-name">城墙</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 78.9%"></div></div>
+        <span class="bar-val">943</span>
+      </div>
+      <div class="bar-row">
+        <span class="bar-name">类型 14</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 13.5%"></div></div>
+        <span class="bar-val">161</span>
+      </div>
+      <div class="bar-row">
+        <span class="bar-name">城 / 建筑</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 7.3%"></div></div>
+        <span class="bar-val">87</span>
+      </div>
+      <div class="bar-row">
+        <span class="bar-name">类型 20</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 0.3%"></div></div>
+        <span class="bar-val">4</span>
+      </div>
+    </div>
+
+    <div class="map-wrap">
+      <img src="objects_map.png" alt="物件摆放分布图">
+      <p class="map-cap">1195 个物件在 256×256 格舞台上的位置（ou 半顶点坐标）。城墙沿城郭连成一圈，城/建筑散落在各州郡，类型 14 密集在中原腹地。</p>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>类型号</th><th>数量</th><th>含义（据反汇编）</th></tr></thead>
+        <tbody>
+          <tr><td><code>46 / 47 / 48</code></td><td>299 / 606 / 38</td><td>城墙（三档）</td></tr>
+          <tr><td><code>0–7</code></td><td>87</td><td>城、关、港等建筑</td></tr>
+          <tr><td><code>14</code></td><td>161</td><td>未归类物件（非城墙、非建筑）</td></tr>
+          <tr><td><code>20</code></td><td>4</td><td>少量特殊物件</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note"><strong>关键差异：</strong>原版 OBJS 清单里<strong>没有植被</strong>——树不是从这份摆放数据来的。地图上的树木由运行时逻辑生成，与城墙、建筑走的是两条路。所以「物件动画」真正每帧驱动的主体，是这 943 条城墙和 87 座城/建筑。</div>
+  </section>
+
+  <footer>静态素材是「画什么」，动态素材是「怎么让画出来的东西随时间变」——前者靠贴图数据，后者靠每帧的代码。</footer>
+</div>

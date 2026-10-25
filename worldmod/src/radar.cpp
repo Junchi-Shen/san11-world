@@ -3,9 +3,9 @@
 // per terrain cell (4x4 vertices), the window's centre cell at pixel (151.5, 151.5), x = row (east),
 // y = column (south); a parchment map inside a circle of radius ~127, the compass frame around it.
 // worldmod moves the radar window with the camera (worldmod.cpp, minimapFollow) and repaints the map
-// area here: inside China it copies Koei's own pixels, elsewhere it tiles a parchment patch taken from
-// Koei's picture, tinted with Koei's sea / river colours for water and drawn in Koei's road colour for
-// roads. Everything is learnt from the original picture the first time the radar is shown.
+// area here: inside China it copies Koei's own pixels, elsewhere it paints Koei's parchment colour with
+// fine deterministic noise, tinted with Koei's sea / river colours for water and drawn in Koei's road
+// colour for roads. Everything is learnt from the original picture the first time the radar is shown.
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
@@ -20,12 +20,11 @@ static const int16_t* const IMAGES = (const int16_t*)0x786aa8; // 16-byte record
 typedef IDirect3DTexture9* (__thiscall* PageTextureFn)(void* mgr, int page);   // 0x4342c0
 
 static const float R_MAP = 126.0f;                            // map circle radius in pixels (the frame begins at ~128)
-static const int PATCH = 64;
 
 static bool g_learned = false;
 static int g_w = 0, g_h = 0;
 static std::vector<uint32_t> g_orig;                          // Koei's picture (for the China window)
-static uint32_t g_patch[PATCH * PATCH];
+static uint32_t g_paper = 0;                                  // Koei's plain parchment colour
 static uint32_t g_sea = 0, g_river = 0, g_road = 0;
 static IDirect3DTexture9* g_tex = nullptr;
 
@@ -83,7 +82,7 @@ bool radarLearn(const RadarWorld& w, TraceLogFn log) {
     for (int y = 0; y < g_h; y++) memcpy(&g_orig[(size_t)y * g_w], (uint8_t*)lr.pBits + (size_t)y * lr.Pitch, 4 * g_w);
     t->UnlockRect(0);
     // colours of Koei's sea, rivers and roads (the picture shows the China window)
-    std::vector<uint32_t> sea, river, road;
+    std::vector<uint32_t> sea, river, road, paper;
     for (int y = 0; y < g_h; y++) for (int x = 0; x < g_w; x++) {
         if (hypotf(x + 0.5f - g_w * 0.5f, y + 0.5f - g_h * 0.5f) > R_MAP - 6) continue;
         int lo, hi, cr, cc; pixelHex(w.chinaLo, w.chinaHi, x, y, &lo, &hi, &cr, &cc);
@@ -94,36 +93,49 @@ bool radarLearn(const RadarWorld& w, TraceLogFn log) {
         if (tt == 8) sea.push_back(p);
         else if (tt == 7 && B > R + 8) river.push_back(p);
         else if (isRoad(tt) && R > B + 20) road.push_back(p);
+        else if (!isWater(tt) && !isRoad(tt)) paper.push_back(p);
     }
     g_sea = median(sea); g_river = river.empty() ? g_sea : median(river); g_road = median(road);
-    // parchment: the PATCHxPATCH square inside the circle with the most plain land (no water, no road nearby)
-    int best = -1, bx = 0, by = 0;
-    for (int y0 = 24; y0 + PATCH < g_h - 24; y0 += 8) for (int x0 = 24; x0 + PATCH < g_w - 24; x0 += 8) {
-        float dx = x0 + PATCH * 0.5f - g_w * 0.5f, dy = y0 + PATCH * 0.5f - g_h * 0.5f;
-        if (hypotf(dx, dy) + PATCH * 0.71f > R_MAP) continue;
-        int plain = 0;
-        for (int y = y0; y < y0 + PATCH; y += 2) for (int x = x0; x < x0 + PATCH; x += 2) {
-            int lo, hi, cr, cc; pixelHex(w.chinaLo, w.chinaHi, x, y, &lo, &hi, &cr, &cc);
-            int tt = hexType(w, lo, hi);
-            if (tt >= 0 && !isWater(tt) && !isRoad(tt)) plain++;
-        }
-        if (plain > best) { best = plain; bx = x0; by = y0; }
-    }
-    for (int y = 0; y < PATCH; y++) for (int x = 0; x < PATCH; x++)
-        g_patch[y * PATCH + x] = g_orig[(size_t)(by + y) * g_w + bx + x];          // parchment() mirrors it
+    g_paper = paper.empty() ? 0xff9aa08a : median(paper);
     g_tex = t;
     g_learned = true;
-    if (log) log("radar: learnt Koei's picture (%dx%d): sea %06x (%zu px), river %06x (%zu), road %06x (%zu), parchment patch at (%d,%d), %d/%d plain",
-                 g_w, g_h, g_sea & 0xffffff, sea.size(), g_river & 0xffffff, river.size(), g_road & 0xffffff, road.size(), bx, by, best, PATCH * PATCH / 4);
+    if (log) log("radar: learnt Koei's picture (%dx%d): sea %06x (%zu px), river %06x (%zu), road %06x (%zu), paper %06x (%zu px)",
+                 g_w, g_h, g_sea & 0xffffff, sea.size(), g_river & 0xffffff, river.size(), g_road & 0xffffff, road.size(), g_paper & 0xffffff, paper.size());
     return true;
 }
 
+// deterministic value noise, anchored to world cells: no tiling period, so the parchment never repeats
+static inline uint32_t hashU(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+
+static inline float lattice(int x, int y, uint32_t seed) {
+    return (hashU((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u ^ seed) & 0xffff) * (1.0f / 65535.0f);
+}
+
+static float valueNoise(float x, float y, uint32_t seed) {
+    int xi = (int)floorf(x), yi = (int)floorf(y);
+    float fx = x - xi, fy = y - yi;
+    fx = fx * fx * (3.0f - 2.0f * fx); fy = fy * fy * (3.0f - 2.0f * fy);
+    float a = lattice(xi, yi, seed), b = lattice(xi + 1, yi, seed);
+    float c = lattice(xi, yi + 1, seed), d = lattice(xi + 1, yi + 1, seed);
+    float ab = a + (b - a) * fx, cd = c + (d - c) * fx;
+    return ab + (cd - ab) * fy;
+}
+
+static inline uint32_t shade(uint32_t p, int k) {
+    int r = ((p >> 16) & 0xff) + k, g = ((p >> 8) & 0xff) + k, b = (p & 0xff) + k;
+    r = r < 0 ? 0 : r > 255 ? 255 : r;
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    b = b < 0 ? 0 : b > 255 ? 255 : b;
+    return 0xff000000u | (uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b;
+}
+
 static inline uint32_t parchment(int cr, int cc) {
-    // mirrored tiling in world cells keeps the texture fixed to the ground while the window moves
-    int u = ((cr % (2 * PATCH)) + 2 * PATCH) % (2 * PATCH), v = ((cc % (2 * PATCH)) + 2 * PATCH) % (2 * PATCH);
-    if (u >= PATCH) u = 2 * PATCH - 1 - u;
-    if (v >= PATCH) v = 2 * PATCH - 1 - v;
-    return g_patch[v * PATCH + u];
+    float n = 0.6f * valueNoise(cr * 0.125f, cc * 0.125f, 0x9e3779b9u)
+            + 0.4f * valueNoise(cr * 0.5f, cc * 0.5f, 0x85ebca6bu);
+    return shade(g_paper, (int)lroundf((n - 0.5f) * 20.0f));
 }
 
 bool radarPaint(const RadarWorld& w, int wlo, int whi) {

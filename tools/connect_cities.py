@@ -4,11 +4,12 @@
 
 In Koei's map rivers (川 6), cliffs (崖 15) and banks (岸 14) stop land units; armies cross them only on
 main roads (主徑 10), plank roads (棧道 11) and ferries (渡所 12). The generated world has Koei's share of
-those obstacles, so a city link from gen_bases.py does not mean there is a way to walk. For each link
-(new city <-> new city, or new city <-> Koei city through the nearest gateway outside China) this tool
-finds the cheapest route over the current terrain, preferring existing roads, and turns it into road:
-cliffs become plank roads, streams and rivers ferries, banks and other land main roads. Sea is crossed
-by sailing (left as it is) only when no land route exists nearby, and the bank where the route lands is opened. China's block is never changed.
+those obstacles, so a city link from gen_bases.py does not mean there is a way to walk. For each link with
+a new city (from city to city, Koei's cities included) this tool finds the cheapest route over the current
+terrain, preferring existing roads, and turns it into road: cliffs become plank roads, streams and rivers
+ferries, banks and other land main roads. Sea is crossed by sailing (left as it is) only when no land route
+exists nearby, and the bank where the route lands is opened. Roads go into China's block too (make_world.py
+keeps them and paints them on Koei's stage), but never over Koei's bases, facility plots or dikes.
 Then it reports which cities are still unreachable on foot and by any route the game's A* accepts.
 
 Writes world_dir/world_types.npy (the previous one is kept once as world_types.before_roads.npy).
@@ -24,20 +25,22 @@ from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 from make_world import (BRIDGE, CITY, FORD, MOUNTAIN, PATH, PLANK, RIVER, ROAD, SEA, SHORE, STREAM, COVER,
-                        china_box, china_gateways, dist_to_china, hex_ring)
-from worldgeo import WorldSpec
+                        china_box, dist_to_china, hex_ring, lonlat_to_hex, to_hex)
+from worldgeo import WorldGeo, WorldSpec
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"
 
 # route cost per hex entered (existing roads cheapest); inf = never
 COST = np.full(256, np.inf, np.float32)
-for k, c in {0: 1.0, 1: 1.0, 2: 1.4, 3: 2.2, 4: 3.0, 5: 1.6, 9: 1.3, SHORE: 1.2, MOUNTAIN: 7.0, STREAM: 6.0,
-             RIVER: 20.0, SEA: 5.0, ROAD: 0.35, PLANK: 0.5, BRIDGE: 0.5, FORD: 1.5, PATH: 1.0, CITY: 1.0,
+# (mountains, streams and rivers cheap enough that roads take passes and ferries rather than detours)
+for k, c in {0: 1.0, 1: 1.0, 2: 1.4, 3: 2.2, 4: 3.0, 5: 1.6, 9: 1.3, SHORE: 1.2, MOUNTAIN: 3.5, STREAM: 3.0,
+             RIVER: 6.0, SEA: 5.0, ROAD: 0.6, PLANK: 0.8, BRIDGE: 0.8, FORD: 1.5, PATH: 1.0, CITY: 1.0,
              17: 1.0, 18: 1.0}.items():
     COST[k] = c
 # the game's A* (0x567520) may enter these terrain types (table 0x8a5df8); 7/8 by boat
 ASTAR = np.zeros(256, bool); ASTAR[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 16, 17, 18]] = True
+FOOT = ASTAR.copy(); FOOT[[RIVER, SEA]] = False
 
 
 def graph(cost):
@@ -111,52 +114,34 @@ def main():
         if cid >= 42:
             for p, q in [(y, x)] + hex_ring(y, x):
                 footprint[p, q] = True
-    in_china = np.zeros((R, C), bool)
+    # China's block: the patch (make_world.py china_patch()) is drawn like the world; on the rest of Koei's
+    # block roads may be laid too (make_world.py paints them on his stage), except over his bases, facility
+    # plots and dikes, which a road crosses as they are
     s_lo, s_hi = china_box(spec)
-    in_china[s_lo, s_hi] = True
+    if (w / "china_patch_types.npy").exists():
+        pt = np.load(w / "china_patch_types.npy")         # the patch's terrain without roads, 255 = not patched
+        t[s_lo, s_hi] = np.where(pt != 255, pt, t[s_lo, s_hi])
+    koei_shex = np.load(DATA / "china_shex.npy")
+    keep = np.zeros((R, C), bool)
+    keep[s_lo, s_hi] = (np.isin(koei_shex[..., 0], (CITY, 17, 18)) | (koei_shex[..., 5] != 0)
+                        | (koei_shex[..., 3] != 0))
     border = dist_to_china(spec, R, C) <= 3
-    gates = china_gateways(t, spec, koei)                  # [(koei name, lo, hi)] just outside the block
-    gate_of = {}
-    for k in koei:
-        ky, kx = pos[k["id"]]
-        best = min(gates, key=lambda g: (g[1] - ky) ** 2 + (g[2] - kx) ** 2)
-        gate_of[k["id"]] = (best[1], best[2])
+    border[s_lo, s_hi] = False
 
     def cost_fn(y0, y1, x0, x1, sea=True):
         tt = t[y0:y1, x0:x1]
         c = COST[tt].copy()
         if not sea:
             c[tt == SEA] = np.inf                          # first try to walk
-        c[border[y0:y1, x0:x1]] *= 4
-        c[in_china[y0:y1, x0:x1]] = np.inf
+        c[border[y0:y1, x0:x1]] *= 4                       # not along the outside of the block's edge
+        kp = keep[y0:y1, x0:x1]
+        c[kp] = np.where(FOOT[tt], c, np.inf)[kp]          # Koei's bases, plots, dikes: only as they are
         c[footprint[y0:y1, x0:x1]] = 1.0
         return c
 
-    edges = set()
-    for c in links["new"]:
-        for n in c["neighbours"]:
-            if n >= ncity:
-                continue                                   # gates and ports
-            edges.add((min(c["id"], n), max(c["id"], n)))
-    def ends(e):
-        i, j = e
-        pi = gate_of[i] if i < 42 else pos[i]
-        pj = gate_of[j] if j < 42 else pos[j]
-        return pi, pj
-    order = sorted(edges, key=lambda e: np.hypot(*(np.subtract(*ends(e)))))
-    if not (w / "world_types.before_roads.npy").exists():
-        shutil.copy2(w / "world_types.npy", w / "world_types.before_roads.npy")
-    made = {ROAD: 0, PLANK: 0, BRIDGE: 0}
-    failed = []
-    for e in order:
-        pa, pb = ends(e)
-        path = route(t, lambda *r: cost_fn(*r, sea=False), pa, pb, margins=(60, 160))     # a land route if there is one nearby
-        if path is None:
-            path = route(t, cost_fn, pa, pb)                                               # islands: sail
-        if path is None:
-            failed.append(e); continue
+    def lay(path):
         for (y, x) in path:
-            if footprint[y, x] or in_china[y, x]:
+            if footprint[y, x] or keep[y, x]:
                 continue
             k = t[y, x]
             if k == MOUNTAIN:
@@ -166,6 +151,46 @@ def main():
             elif k in COVER or k in (SHORE, FORD, PATH, 4):
                 t[y, x] = ROAD; made[ROAD] += 1
             # SEA: sailed across, left as it is
+
+    edges = set()
+    for c in links["new"]:
+        for n in c["neighbours"]:
+            if n < ncity:                                  # not gates and ports
+                edges.add((min(c["id"], n), max(c["id"], n)))
+    order = sorted(edges, key=lambda e: np.hypot(*(np.subtract(pos[e[0]], pos[e[1]]))))
+    # historical routes: data/road_waypoints.json [{cities: [a, b], via: [[lat, lon], ...]}] (passes, ...)
+    via = {}
+    if (DATA / "road_waypoints.json").exists():
+        geo = WorldGeo(spec, DATA / "cities_georef.json")
+        ids = {nm: cid for cid, nm in name.items()}
+        for wp in json.loads((DATA / "road_waypoints.json").read_text(encoding="utf-8")):
+            i, j = (ids.get(n) for n in wp["cities"])
+            if i is None or j is None:
+                continue
+            lo, x = lonlat_to_hex(geo, np.array([q[1] for q in wp["via"]]), np.array([q[0] for q in wp["via"]]))
+            pts = [(int(y), int(xx)) for y, xx in zip(*to_hex(lo, x))]
+            via[(i, j)], via[(j, i)] = pts, pts[::-1]
+    if not (w / "world_types.before_roads.npy").exists():
+        shutil.copy2(w / "world_types.npy", w / "world_types.before_roads.npy")
+    made = {ROAD: 0, PLANK: 0, BRIDGE: 0}
+    failed = []
+    for e in order:
+        pa, pb = pos[e[0]], pos[e[1]]
+        path = []
+        pts = [pa] + via.get(e, []) + [pb]
+        for p, q in zip(pts, pts[1:]) if e in via else ():
+            seg = route(t, lambda *r: cost_fn(*r, sea=False), p, q, margins=(60, 160))
+            if seg is None:
+                path = []; break
+            path += seg
+        if path:
+            lay(path); continue
+        path = route(t, lambda *r: cost_fn(*r, sea=False), pa, pb, margins=(60, 160))   # a land route if there is one nearby
+        if path is None:
+            path = route(t, cost_fn, pa, pb)                                             # islands: sail
+        if path is None:
+            failed.append(e); continue
+        lay(path)
     # cities on the main landmass that are still cut off on foot (their links all cross water): one more
     # land-only road to the nearest city that is reachable on foot. Islands keep their sea routes.
     def foot_labels():
@@ -175,7 +200,8 @@ def main():
     main_land = land[pos[1]]
     for _ in range(3):
         lab = foot_labels(); main_c = lab[pos[1]]
-        cut = [cid for cid in sorted(pos) if cid < ncity and cid >= 42 and lab[pos[cid]] != main_c and land[pos[cid]] == main_land]
+        cut = [cid for cid in sorted(pos) if cid < ncity and cid >= 42
+               and lab[pos[cid]] != main_c and land[pos[cid]] == main_land]
         if not cut:
             break
         reach = [cid for cid in sorted(pos) if cid < ncity and lab[pos[cid]] == main_c]
@@ -183,17 +209,10 @@ def main():
             a_ = pos[cid]
             near = sorted(reach, key=lambda k: (pos[k][0] - a_[0]) ** 2 + (pos[k][1] - a_[1]) ** 2)[:4]
             for k in near:
-                b_ = gate_of[k] if k < 42 else pos[k]
-                path = route(t, lambda *r: cost_fn(*r, sea=False), a_, b_, margins=(80, 200, 500))
+                path = route(t, lambda *r: cost_fn(*r, sea=False), a_, pos[k], margins=(80, 200, 500))
                 if path is None:
                     continue
-                for (y, x) in path:
-                    if footprint[y, x] or in_china[y, x]:
-                        continue
-                    kk = t[y, x]
-                    if kk == MOUNTAIN: t[y, x] = PLANK; made[PLANK] += 1
-                    elif kk in (STREAM, RIVER): t[y, x] = BRIDGE; made[BRIDGE] += 1
-                    elif kk in COVER or kk in (SHORE, FORD, PATH, 4): t[y, x] = ROAD; made[ROAD] += 1
+                lay(path)
                 print(f"  land road for {name[cid]} -> {name[k]}")
                 break
     np.save(w / "world_types.npy", t)

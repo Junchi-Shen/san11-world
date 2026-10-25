@@ -10,7 +10,9 @@ data/china_k3st_v.npy) so the world outside China has the same granularity:
   * 3D heights follow Koei: flat valleys, ridges rising 40-130 above them, water at 0;
     vertex materials are sampled from China's per-terrain material statistics
 China's own hexes and stage vertices are copied in, and the edge of the China block is continued
-outwards (mountains, land cover, rivers) so there is no visible seam.
+outwards (mountains, land cover, rivers) so there is no visible seam. Koei's south-east mountain margin
+(Fujian, south Zhejiang) is the exception: its land is classified and drawn like the generated world
+(china_patch()), so cities fit there.
 
 Outputs (in <out_dir>):
   world_shex.bin   b"WSHX", u32 cols(W), u32 rows(H), then rows*cols SHEX0008 records (11 bytes,
@@ -20,6 +22,11 @@ Outputs (in <out_dir>):
   world_mat.npy    global vertex materials (0..35), same shape
   world_info.json  the WorldSpec and statistics
   cities_world.json new city sites
+  china_overrides.bin  edits of Koei's China block (the sea strip and the patch), see write_overrides()
+  china_patch.npy  200x200 mask of the patched China hexes
+  china_patch_types.npy  their terrain before roads (255 elsewhere), where connect_cities.py starts from
+  china_patch.bin  the stage vertices worldmod draws from the world grid: the patch, and the roads
+                   connect_cities.py laid on Koei's block (his heights, painted with road material)
 
 Global vertex of hex (lo, hi): z = lo*4 + 112, x = hi*4 + 112 + 2*(lo & 1) (hex centre +2, +2).
 
@@ -410,6 +417,45 @@ def china_sea_strip(china_shex):
     return out
 
 
+PATCH_AREA = 90         # Koei's decorative mountain margin; its land in the south-east (Fujian, south Zhejiang)
+
+
+def china_patch(china_shex, e0, relief, seed):
+    """Koei draws Fujian and the south Zhejiang coast as one block of mountains (special area 90), so no
+    city fits there. Its land hexes are classified again from the DEM like the generated world (mountains
+    on rugged ground, Koei's China mix of cover, banks on the coast); Koei's coastline, rivers and sea stay.
+    e0, relief: the block's 200x200 hex elevation fields. Returns (override records {(lo, hi): record},
+    200x200 mask of the patched hexes); the 3D terrain there is generated too (china_patch.bin)."""
+    rng = np.random.default_rng(seed)
+    t = china_shex[..., 0]
+    area = china_shex[..., 1].astype(int) | (china_shex[..., 2].astype(int) << 8)
+    patch = (area == PATCH_AREA) & np.isin(t, (SHORE, MOUNTAIN))
+    # Koei's streams around it join the patch unchanged, so connect_cities.py may ferry across them (the
+    # patch is otherwise walled in by his streams and mountains)
+    streams = (t == STREAM) & (ndimage.distance_transform_edt(~patch) <= 2)
+    water = np.isin(t, WATER)
+    dw = ndimage.distance_transform_edt(~water).astype(np.float32)
+    mtn, _ = mountain_mask(e0, relief, dw, patch, rng)
+    dmt = ndimage.distance_transform_edt(~mtn).astype(np.float32)
+    cover = land_cover(t.shape, {"china": np.ones(t.shape, np.float32)}, dw, dmt, e0, rng, patch & ~mtn)
+    new = np.where(mtn, MOUNTAIN, cover).astype(np.uint8)
+    shore = ~mtn & hex_neighbors(water) & (uniform_noise(t.shape, rng, 1.3) < np.where(hex_neighbors(t == SEA), 0.75, 0.42))
+    new[shore] = SHORE
+    # the other bytes as on Koei's hexes of the same type (most common value), flags clear
+    land = ~np.isin(t, WATER)
+    b4 = {k: np.bincount(china_shex[..., 4][land & (t == k)]).argmax() for k in np.unique(new[patch])}
+    out = {}
+    for lo, hi in zip(*np.nonzero(patch)):
+        r = china_shex[lo, hi].copy()
+        r[0] = new[lo, hi]
+        r[4] = b4[r[0]]
+        r[3] = r[5] = r[6] = r[7] = r[8] = r[10] = 0
+        out[(int(lo), int(hi))] = r
+    for lo, hi in zip(*np.nonzero(streams)):
+        out[(int(lo), int(hi))] = china_shex[lo, hi].copy()
+    return out, patch | streams
+
+
 def write_overrides(path, overrides):
     """china_overrides.bin: b"WCOV", u32 count, then count x (u16 lo, u16 hi, 11-byte SHEX record).
     worldmod applies these on top of the stock China block."""
@@ -744,8 +790,6 @@ def main():
     overrides = {} if a.keep_china_strip else china_sea_strip(china_shex)
     for (lo, hi), r in overrides.items():
         china_shex[lo, hi] = r
-    write_overrides(out / "china_overrides.bin", overrides)
-    china_t = china_shex[..., 0]
     t0 = time.time()
 
     # ---- hex level: elevation
@@ -758,6 +802,35 @@ def main():
         if a.cache:
             np.savez(a.cache, e0=e0, relief=relief, lat=lat_c, key=key)
     print(f"hex elevation sampled ({time.time() - t0:.0f}s)")
+    china_learn = china_shex.copy()             # Koei's own types: the 3D materials are learned from these
+    patch_ov, patch_hex = china_patch(china_shex, e0[CL, CH], relief[CL, CH], a.seed + 101)
+    patch_types = np.full((200, 200), 255, np.uint8)  # the patch before roads (connect_cities.py starts from it)
+    for (lo, hi), r in patch_ov.items():
+        patch_types[lo, hi] = r[0]
+    road_hex = np.zeros((200, 200), bool)       # roads connect_cities.py laid on Koei's own part of the block
+    if a.types_from:                            # keep the roads connect_cities.py laid in the block
+        prev = np.load(a.types_from)[CL, CH]
+        laid = np.isin(prev, (ROAD, PLANK, BRIDGE))
+        for (lo, hi), r in patch_ov.items():
+            if laid[lo, hi]:
+                r[0] = prev[lo, hi]
+        kt = china_learn[..., 0]
+        b4 = {k: int(np.bincount(china_learn[..., 4][kt == k]).argmax()) if (kt == k).any() else 6
+              for k in (ROAD, PLANK, BRIDGE)}
+        for lo, hi in zip(*np.nonzero(laid & ~patch_hex & (china_shex[..., 0] != prev))):
+            r = china_shex[lo, hi].copy()
+            r[0] = prev[lo, hi]
+            r[4] = b4[r[0]]
+            patch_ov[(int(lo), int(hi))] = r
+            road_hex[lo, hi] = True
+    for (lo, hi), r in patch_ov.items():
+        china_shex[lo, hi] = r
+    overrides.update(patch_ov)
+    write_overrides(out / "china_overrides.bin", overrides)
+    np.save(out / "china_patch.npy", patch_hex)
+    np.save(out / "china_patch_types.npy", patch_types)
+    china_t = china_shex[..., 0]
+    print(f"China patch: {int(patch_hex.sum())} hexes of Koei's south-east mountains classified again")
 
     if a.types_from:
         t = np.load(a.types_from)
@@ -870,7 +943,7 @@ def main():
     # ---- vertex level (global vertex grid)
     k3st = np.load(DATA / "china_k3st_v.npy")
     hbins = np.array([40, 80, 120, 160, 200])
-    mats, cdf = learn_materials(china_shex, k3st, hbins)
+    mats, cdf = learn_materials(china_learn, k3st, hbins)
     VZ, VX = R * 4 + 225, C * 4 + 225
     vrng = np.random.default_rng(a.seed + 7)
     hh = hex_heights(t, e0, t == MOUNTAIN, vrng)
@@ -900,20 +973,33 @@ def main():
         mat[z0:z1] = mm
         if z0 % 2048 == 0:
             print(f"  vertex rows {z0}/{VZ} ({time.time() - t0:.0f}s)")
-    # China's own stage, with the generated surroundings eased into its edge heights
+    # China's own stage, with the generated surroundings (and the patch) eased into its edge heights
     gz, gx = spec.china_lo * 4, spec.china_hi * 4
+    kz, kx = np.mgrid[112:913, 112:913]
+    klo = np.clip(np.round((kz - 114) / 4).astype(int), 0, 199)
+    khi = np.clip(np.round((kx - 114 - 2 * (klo & 1)) / 4).astype(int), 0, 199)
+    pv = patch_hex[klo, khi]                          # stage vertices of the patch: generated, not Koei's
     pad = 24
     a0, a1 = gz + 112 - pad, gz + 913 + pad
     b0, b1 = gx + 112 - pad, gx + 913 + pad
     win = hgt[a0:a1, b0:b1].astype(np.float32)
     inside = np.zeros(win.shape, bool)
-    inside[pad:-pad, pad:-pad] = True
-    win[inside] = k3st[112:913, 112:913, 0].ravel()
+    inside[pad:-pad, pad:-pad] = ~pv
+    win[inside] = k3st[112:913, 112:913, 0][~pv]
     d, (iz, ix) = ndimage.distance_transform_edt(~inside, return_indices=True)
     w = 1 - smoothstep(d, 0, pad)
     win = np.where(inside, win, w * win[iz, ix] + (1 - w) * win)
     hgt[a0:a1, b0:b1] = np.clip(np.round(win), 0, 255).astype(np.uint8)
-    mat[gz + 112:gz + 913, gx + 112:gx + 913] = k3st[112:913, 112:913, 7]
+    blk = (slice(gz + 112, gz + 913), slice(gx + 112, gx + 913))
+    # roads laid on Koei's own block keep his heights and get the material Koei's roads of that type have
+    rv = road_hex[klo, khi] & ~pv
+    road_mat = mats[china_t[klo, khi], np.digitize(k3st[112:913, 112:913, 0], hbins), 0]
+    mat[blk] = np.where(pv, mat[blk], np.where(rv, road_mat, k3st[112:913, 112:913, 7]))
+    # china_patch.bin: b"WCPM", u32 1025, then 1025x1025 bytes over Koei's stage vertices, 1 = worldmod
+    # draws the generated vertex (world_height/world_mat) instead of Koei's there
+    pvs = np.zeros((1025, 1025), np.uint8)
+    pvs[112:913, 112:913] = pv | rv
+    (out / "china_patch.bin").write_bytes(b"WCPM" + struct.pack("<I", 1025) + pvs.tobytes())
     hgt.flush()
     mat.flush()
     info["vertex_shape"] = [VZ, VX]
